@@ -1,14 +1,18 @@
+
 name: Update 8TV IPTV
 
 on:
   workflow_dispatch:
 
   schedule:
-    # Every 6 hours
-    - cron: "0 */6 * * *"
+    - cron: "0 */4 * * *"
 
 permissions:
   contents: write
+
+concurrency:
+  group: update-8tv
+  cancel-in-progress: false
 
 jobs:
   update:
