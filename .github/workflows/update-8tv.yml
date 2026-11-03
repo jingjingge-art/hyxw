@@ -5,31 +5,34 @@ on:
   workflow_dispatch:
 
   schedule:
-    # Every 15 minutes (UTC)
-    - cron: "*/15 * * * *"
+    # Every 10 minutes (UTC)
+    - cron: "*/10 * * * *"
 
 permissions:
   contents: write
 
 concurrency:
   group: update-8tv-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
 
       - name: Run 8TV collector
         run: python update_8tv.py
