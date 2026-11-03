@@ -5,22 +5,26 @@ on:
   workflow_dispatch:
 
   schedule:
-    - cron: "0 */4 * * *"
+    # Every 15 minutes (UTC)
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: write
 
 concurrency:
-  group: update-8tv
-  cancel-in-progress: false
+  group: update-8tv-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -39,7 +43,7 @@ jobs:
 
           if ! git diff --cached --quiet; then
             git commit -m "Update 8TV IPTV stream"
-            git push
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           else
             echo "No changes detected."
           fi
