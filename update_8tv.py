@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import asyncio
 import os
 import re
 import sys
-import json
 import html
 import logging
 import tempfile
 
-from urllib.request import Request, urlopen
-from urllib.parse import urljoin, urlparse, unquote
-from html.parser import HTMLParser
+from urllib.parse import urlparse
+from playwright.async_api import async_playwright
 
 
 # ==================================================
-# Configuration
+# CONFIGURATION
 # ==================================================
 
 SOURCE_URL = "https://tvmalay.my/8tv/"
@@ -26,25 +25,24 @@ CHANNEL_NAME = "8tv"
 
 GENRE_HEADER = "iptv,#genre#"
 
+# Your observed CDN
+ALLOWED_CDN_HOSTS = {
+    "2bfd741e.b-cdn.net"
+}
+
+WAIT_AFTER_LOAD = 12000
+
+WAIT_AFTER_PLAY = 10000
+
+BROWSER_TIMEOUT = 60000
+
+MAX_RUNTIME = 90
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/130.0.0.0 Safari/537.36"
 )
-
-TIMEOUT = 30
-
-MAX_DEPTH = 2
-
-MAX_DOWNLOAD = 2 * 1024 * 1024
-
-MAX_CANDIDATES = 30
-
-# Optional: only permit the CDN host observed in your sample.
-# Change this if the authorized source uses another CDN.
-ALLOWED_CDN_HOSTS = {
-    "2bfd741e.b-cdn.net"
-}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,365 +51,337 @@ logging.basicConfig(
 
 
 # ==================================================
-# HTML Parser
+# URL FILTER
 # ==================================================
 
-class PageParser(HTMLParser):
-
-    def __init__(self):
-        super().__init__()
-        self.links = []
-
-    def handle_starttag(self, tag, attrs):
-
-        attrs = dict(attrs)
-
-        keys = [
-            "src",
-            "href",
-            "data-src",
-            "data-url",
-            "data-hls",
-            "data-file",
-            "data-video"
-        ]
-
-        for key in keys:
-
-            value = attrs.get(key)
-
-            if value:
-                self.links.append(value)
-
-
-# ==================================================
-# HTTP Request
-# ==================================================
-
-def fetch_url(url, referer=None):
-
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/json,*/*"
-        ),
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-
-    if referer:
-        headers["Referer"] = referer
-
-    request = Request(
-        url,
-        headers=headers,
-        method="GET"
-    )
-
-    with urlopen(request, timeout=TIMEOUT) as response:
-
-        data = response.read(MAX_DOWNLOAD)
-
-        charset = (
-            response.headers.get_content_charset()
-            or "utf-8"
-        )
-
-        return data.decode(
-            charset,
-            errors="replace"
-        )
-
-
-# ==================================================
-# Text Normalization
-# ==================================================
-
-def normalize_text(content):
-
-    content = html.unescape(content)
-
-    replacements = {
-        r"\/": "/",
-        r"\u0026": "&",
-        r"\u003d": "=",
-        r"\u003a": ":",
-        r"\x3A": ":",
-        r"\x2F": "/"
-    }
-
-    for old, new in replacements.items():
-        content = content.replace(old, new)
-
-    return content
-
-
-# ==================================================
-# URL Validation
-# ==================================================
-
-def valid_http_url(url):
+def is_stream_url(url):
 
     try:
 
         parsed = urlparse(url)
 
-        return (
-            parsed.scheme.lower() in ("http", "https")
-            and bool(parsed.netloc)
-        )
+        if parsed.scheme not in ("http", "https"):
+            return False
+
+        if not parsed.path.lower().endswith(".m3u8"):
+            return False
+
+        host = (parsed.hostname or "").lower()
+
+        if host not in ALLOWED_CDN_HOSTS:
+            return False
+
+        return True
 
     except Exception:
         return False
 
 
-def is_allowed_stream(url):
-
-    if not valid_http_url(url):
-        return False
+def safe_url(url):
 
     parsed = urlparse(url)
 
-    if not parsed.path.lower().endswith(".m3u8"):
+    # Never print signed tokens into GitHub logs
+    return f"{parsed.hostname}{parsed.path}"
+
+
+# ==================================================
+# PLAYLIST VALIDATION
+# ==================================================
+
+def is_valid_playlist(data, content_type):
+
+    if not data:
         return False
 
-    if ALLOWED_CDN_HOSTS:
-        return parsed.hostname in ALLOWED_CDN_HOSTS
+    text = data.decode(
+        "utf-8",
+        errors="replace"
+    ).lstrip("\ufeff \r\n\t")
 
-    return True
+    if text.startswith("#EXTM3U"):
+        return True
+
+    if "mpegurl" in content_type.lower():
+        return True
+
+    return False
 
 
 # ==================================================
-# M3U8 Extraction
+# BROWSER COLLECTION
 # ==================================================
 
-def extract_stream_urls(content, base_url):
+async def collect_stream():
 
-    content = normalize_text(content)
+    candidates = {}
 
-    patterns = [
+    pending_tasks = []
 
-        # Full HLS URLs, including query parameters
-        r'https?://[^\s"\'<>]+?\.m3u8(?:\?[^\s"\'<>]*)?',
+    async with async_playwright() as p:
 
-        # Relative M3U8 URLs
-        r'["\']([^"\']+?\.m3u8(?:\?[^"\']*)?)["\']',
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--autoplay-policy=no-user-gesture-required",
+                "--disable-dev-shm-usage",
+                "--no-sandbox"
+            ]
+        )
 
-        # Player configuration
-        r'(?:file|source|src|hls|url)\s*[:=]\s*["\']([^"\']+)["\']',
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={
+                "width": 1366,
+                "height": 768
+            },
+            java_script_enabled=True
+        )
 
-    ]
+        page = await context.new_page()
 
-    results = []
+        page.set_default_timeout(
+            BROWSER_TIMEOUT
+        )
 
-    for pattern in patterns:
+        # ------------------------------------------
+        # Capture actual network requests
+        # ------------------------------------------
 
-        for match in re.finditer(
-            pattern,
-            content,
-            re.IGNORECASE
-        ):
+        def on_request(request):
 
-            raw = (
-                match.group(1)
-                if match.lastindex
-                else match.group(0)
+            url = request.url
+
+            if is_stream_url(url):
+
+                candidates.setdefault(
+                    url,
+                    {
+                        "valid": False,
+                        "status": None,
+                        "source": "request"
+                    }
+                )
+
+                logging.info(
+                    "M3U8 request detected: %s",
+                    safe_url(url)
+                )
+
+        # ------------------------------------------
+        # Capture network responses
+        # ------------------------------------------
+
+        async def on_response(response):
+
+            url = response.url
+
+            if not is_stream_url(url):
+                return
+
+            item = candidates.setdefault(
+                url,
+                {
+                    "valid": False,
+                    "status": None,
+                    "source": "response"
+                }
             )
 
-            raw = raw.strip()
+            item["status"] = response.status
 
-            if not raw:
+            try:
+
+                if not (200 <= response.status < 300):
+                    return
+
+                data = await response.body()
+
+                content_type = (
+                    response.headers.get(
+                        "content-type",
+                        ""
+                    )
+                )
+
+                if is_valid_playlist(
+                    data,
+                    content_type
+                ):
+
+                    item["valid"] = True
+
+                    logging.info(
+                        "Valid HLS playlist detected: %s",
+                        safe_url(url)
+                    )
+
+            except Exception as error:
+
+                logging.warning(
+                    "Response inspection failed: %s",
+                    error
+                )
+
+        def response_listener(response):
+
+            task = asyncio.create_task(
+                on_response(response)
+            )
+
+            pending_tasks.append(task)
+
+        page.on("request", on_request)
+
+        page.on("response", response_listener)
+
+        # ------------------------------------------
+        # Open source page
+        # ------------------------------------------
+
+        logging.info("Opening 8TV source page")
+
+        try:
+
+            await page.goto(
+                SOURCE_URL,
+                wait_until="domcontentloaded",
+                timeout=BROWSER_TIMEOUT
+            )
+
+        except Exception as error:
+
+            logging.warning(
+                "Page navigation warning: %s",
+                str(error)[:200]
+            )
+
+        # ------------------------------------------
+        # Wait for JavaScript and iframe loading
+        # ------------------------------------------
+
+        logging.info(
+            "Waiting for player initialization..."
+        )
+
+        await page.wait_for_timeout(
+            WAIT_AFTER_LOAD
+        )
+
+        # ------------------------------------------
+        # Attempt to start video playback
+        # ------------------------------------------
+
+        try:
+
+            await page.evaluate("""
+                async () => {
+                    const videos =
+                        document.querySelectorAll('video');
+
+                    for (const video of videos) {
+                        video.muted = true;
+
+                        try {
+                            await video.play();
+                        } catch (e) {}
+                    }
+                }
+            """)
+
+        except Exception:
+            pass
+
+        # Try common player play buttons
+        selectors = [
+            ".vjs-big-play-button",
+            ".plyr__control--overlaid",
+            "button[aria-label*='play' i]"
+        ]
+
+        for selector in selectors:
+
+            try:
+
+                button = page.locator(
+                    selector
+                ).first
+
+                if await button.is_visible(
+                    timeout=1000
+                ):
+
+                    await button.click(
+                        timeout=2000
+                    )
+
+                    logging.info(
+                        "Player play button clicked"
+                    )
+
+                    break
+
+            except Exception:
                 continue
 
-            # Preserve signed URL query parameters.
-            candidate = urljoin(base_url, raw)
+        # ------------------------------------------
+        # Wait for CDN requests
+        # ------------------------------------------
 
-            if is_allowed_stream(candidate):
-
-                if candidate not in results:
-                    results.append(candidate)
-
-    return results
-
-
-# ==================================================
-# Extract iframe and script URLs
-# ==================================================
-
-def extract_embedded_pages(content, base_url):
-
-    parser = PageParser()
-
-    try:
-        parser.feed(content)
-    except Exception:
-        pass
-
-    results = []
-
-    for link in parser.links:
-
-        link = html.unescape(link.strip())
-
-        if not link:
-            continue
-
-        full_url = urljoin(base_url, link)
-
-        if not valid_http_url(full_url):
-            continue
-
-        parsed = urlparse(full_url)
-
-        # Only inspect pages/scripts on the source domain.
-        if parsed.netloc != urlparse(base_url).netloc:
-            continue
-
-        if full_url not in results:
-            results.append(full_url)
-
-    return results
-
-
-# ==================================================
-# Recursive Collector
-# ==================================================
-
-def collect_streams(url, depth=0, visited=None):
-
-    if visited is None:
-        visited = set()
-
-    if depth > MAX_DEPTH:
-        return []
-
-    if url in visited:
-        return []
-
-    visited.add(url)
-
-    logging.info(
-        "Scanning [%s]: %s",
-        depth,
-        url
-    )
-
-    try:
-
-        content = fetch_url(
-            url,
-            referer=SOURCE_URL
+        logging.info(
+            "Waiting for CDN M3U8 requests..."
         )
 
-    except Exception as error:
-
-        logging.warning(
-            "Page request failed: %s",
-            error
+        await page.wait_for_timeout(
+            WAIT_AFTER_PLAY
         )
 
-        return []
+        # ------------------------------------------
+        # Inspect iframe pages
+        # ------------------------------------------
 
-    candidates = extract_stream_urls(
-        content,
+        for frame in page.frames:
+
+            logging.info(
+                "Frame inspected: %s",
+                frame.url[:180]
+            )
+
+        # Finish pending response inspections
+        if pending_tasks:
+
+            await asyncio.gather(
+                *pending_tasks,
+                return_exceptions=True
+            )
+
+        await browser.close()
+
+    # ----------------------------------------------
+    # Return valid playlists only
+    # ----------------------------------------------
+
+    valid_urls = [
         url
-    )
+        for url, info in candidates.items()
+        if info["valid"]
+    ]
 
     logging.info(
-        "Found %d stream candidates",
+        "Total M3U8 requests: %d",
         len(candidates)
     )
 
-    if depth < MAX_DEPTH:
-
-        embedded = extract_embedded_pages(
-            content,
-            url
-        )
-
-        for page in embedded:
-
-            results = collect_streams(
-                page,
-                depth + 1,
-                visited
-            )
-
-            candidates.extend(results)
-
-            if len(candidates) >= MAX_CANDIDATES:
-                break
-
-    return list(dict.fromkeys(candidates))[
-        :MAX_CANDIDATES
-    ]
-
-
-# ==================================================
-# Validate HLS Stream
-# ==================================================
-
-def validate_stream(url):
-
     logging.info(
-        "Validating stream: %s",
-        url
+        "Valid playlists: %d",
+        len(valid_urls)
     )
 
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Referer": SOURCE_URL,
-        "Accept": "*/*",
-        "Range": "bytes=0-65535"
-    }
-
-    try:
-
-        request = Request(
-            url,
-            headers=headers
-        )
-
-        with urlopen(
-            request,
-            timeout=TIMEOUT
-        ) as response:
-
-            if response.status not in (200, 206):
-                return False
-
-            content_type = response.headers.get(
-                "Content-Type",
-                ""
-            ).lower()
-
-            data = response.read(65536)
-
-            body = data.decode(
-                "utf-8",
-                errors="replace"
-            ).lstrip("\ufeff \r\n\t")
-
-            if body.startswith("#EXTM3U"):
-                return True
-
-            if "mpegurl" in content_type:
-                return True
-
-            return False
-
-    except Exception as error:
-
-        logging.warning(
-            "Stream validation failed: %s",
-            error
-        )
-
-        return False
+    return valid_urls
 
 
 # ==================================================
-# Atomic File Update
+# SAVE FILE ATOMICALLY
 # ==================================================
 
 def save_output(stream_url):
@@ -426,9 +396,9 @@ def save_output(stream_url):
     )
 
     fd, temp_path = tempfile.mkstemp(
+        dir=output_dir,
         prefix=".8tv_",
-        suffix=".tmp",
-        dir=output_dir
+        suffix=".tmp"
     )
 
     try:
@@ -448,8 +418,7 @@ def save_output(stream_url):
         )
 
         logging.info(
-            "Updated successfully: %s",
-            OUTPUT_FILE
+            "8TV playlist updated successfully"
         )
 
     except Exception:
@@ -461,72 +430,77 @@ def save_output(stream_url):
 
 
 # ==================================================
-# Main
+# MAIN
 # ==================================================
 
-def main():
+async def main():
 
     logging.info("=" * 50)
-    logging.info("8TV IPTV Collector Started")
-    logging.info("Source: %s", SOURCE_URL)
+
+    logging.info(
+        "8TV IPTV Dynamic Collector Started"
+    )
+
+    logging.info(
+        "Source: %s",
+        SOURCE_URL
+    )
+
     logging.info("=" * 50)
 
     try:
 
-        candidates = collect_streams(
-            SOURCE_URL
+        urls = await asyncio.wait_for(
+            collect_stream(),
+            timeout=MAX_RUNTIME
         )
 
-        if not candidates:
+        if not urls:
 
             raise RuntimeError(
-                "No M3U8 stream found."
+                "No valid M3U8 playlist captured"
             )
+
+        # Select first valid playlist
+        stream_url = urls[0]
 
         logging.info(
-            "Total candidates: %d",
-            len(candidates)
+            "Selected: %s",
+            safe_url(stream_url)
         )
 
-        # Check every candidate until a valid stream is found.
-        for index, stream_url in enumerate(
-            candidates,
-            start=1
-        ):
+        save_output(stream_url)
 
-            logging.info(
-                "Testing candidate %d/%d",
-                index,
-                len(candidates)
-            )
-
-            if validate_stream(stream_url):
-
-                save_output(stream_url)
-
-                logging.info(
-                    "Selected stream successfully."
-                )
-
-                return 0
-
-        raise RuntimeError(
-            "All M3U8 candidates failed validation."
+        logging.info(
+            "Collection completed successfully"
         )
+
+        return 0
+
+    except asyncio.TimeoutError:
+
+        logging.error(
+            "Browser collection timed out"
+        )
+
+        return 1
 
     except Exception as error:
 
         logging.error(
-            "Collector failed: %s",
+            "Collection failed: %s",
             error
         )
 
         logging.warning(
-            "Existing 8tv.txt was not overwritten."
+            "Old 8tv.txt has been preserved"
         )
 
         return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+
+    sys.exit(
+        asyncio.run(main())
+        )
