@@ -1,2 +1,2 @@
 iptv,#genre#
-8tv,https://2bfd741e.b-cdn.net/streamer/8pQTNs9MHm8GJxtGbMGANaFsfetEtr1Qb8g5geHFvk2b.m3u8?expires=1793755949&token=gf98Iwa-BHILzDKyjpzAgOM5SFRTZbN2tIH6vDPnxvQ
+8tv,https://2bfd741e.b-cdn.net/streamer/8pQTNs9MHm8GJxtGbMGANaFsfetEtr1Qb8g5geHFvk2b.m3u8?expires=1793779048&token=AL0qYIlL1Xenr38wd1B8XWdrYmODiF2CFh1iM3-S4fo
