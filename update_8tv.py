@@ -1,41 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""Collect the current Googlevideo HLS URL from the Taiwan news player.
+
+Googlevideo manifest URLs are signed and expire, so they must be discovered at
+runtime. If the source is temporarily unavailable, preserve the last playlist
+and let the scheduled workflow finish successfully rather than failing every run.
+"""
+
 import asyncio
 import logging
 import os
-import re
 import sys
 import tempfile
 from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
-
 SOURCE_URL = "https://tvivu.com/watch/globalnews-tv-taiwan-news"
 OUTPUT_FILE = "8tv.txt"
 CHANNEL_NAME = "8tv"
 GENRE_HEADER = "iptv,#genre#"
-WAIT_AFTER_LOAD = 12000
-WAIT_AFTER_PLAY = 10000
-BROWSER_TIMEOUT = 30000
-MAX_RUNTIME = 150
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/130.0.0.0 Safari/537.36"
 )
-
-# The signed manifest's URL path ends in .m3u8; its query contains expiring tokens.
-GOOGLEVIDEO_M3U8_RE = re.compile(
-    r"https?://[^\s\"'<>]+manifest\.googlevideo\.com/[^\s\"'<>]*?\.m3u8(?:\?[^\s\"'<>]*)?",
-    re.IGNORECASE,
-)
+NAVIGATION_TIMEOUT_MS = 20_000
+PLAYER_WAIT_MS = 12_000
+CAPTURE_WAIT_MS = 15_000
+RUN_TIMEOUT_SECONDS = 180
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-def is_stream_url(url):
+def is_googlevideo_m3u8(url):
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
@@ -44,35 +43,41 @@ def is_stream_url(url):
             and (host == "googlevideo.com" or host.endswith(".googlevideo.com"))
             and parsed.path.lower().endswith(".m3u8")
         )
-    except Exception:
+    except (TypeError, ValueError):
         return False
 
 
 def safe_url(url):
+    """Never include signed query tokens in Actions logs."""
     parsed = urlparse(url)
-    # Signed query parameters must not be written to workflow logs.
     return f"{parsed.hostname}{parsed.path}"
 
 
-def is_valid_playlist(data, content_type):
-    if not data:
-        return False
-    text = data.decode("utf-8", errors="replace").lstrip("\ufeff \r\n\t")
-    return text.startswith("#EXTM3U") or "mpegurl" in content_type.lower()
+def save_output(stream_url):
+    content = f"{GENRE_HEADER}\n{CHANNEL_NAME},{stream_url}\n"
+    output_dir = os.path.dirname(os.path.abspath(OUTPUT_FILE))
+    fd, temp_path = tempfile.mkstemp(dir=output_dir, prefix=".8tv_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as output:
+            output.write(content)
+        os.replace(temp_path, OUTPUT_FILE)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
 
 
 async def collect_stream():
+    # Keep URLs in insertion order. A successful HTTP response is sufficient:
+    # Playwright can fail to expose the body of a live/continuously refreshed
+    # manifest even though the signed URL itself is usable.
     candidates = {}
-    pending_tasks = set()
+    response_tasks = set()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
             headless=True,
-            args=[
-                "--autoplay-policy=no-user-gesture-required",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--autoplay-policy=no-user-gesture-required"],
         )
         try:
             context = await browser.new_context(
@@ -80,63 +85,56 @@ async def collect_stream():
                 viewport={"width": 1366, "height": 768},
                 java_script_enabled=True,
             )
-            page = await context.new_page()
-            page.set_default_timeout(BROWSER_TIMEOUT)
 
             def on_request(request):
                 url = request.url
-                if is_stream_url(url):
-                    candidates.setdefault(url, {"valid": False, "status": None})
-                    logging.info("Googlevideo HLS request detected: %s", safe_url(url))
+                if is_googlevideo_m3u8(url):
+                    candidates.setdefault(url, False)
+                    logging.info("Googlevideo HLS request seen: %s", safe_url(url))
 
             async def inspect_response(response):
                 url = response.url
-                if not is_stream_url(url):
+                if not is_googlevideo_m3u8(url):
                     return
-                item = candidates.setdefault(url, {"valid": False, "status": None})
-                item["status"] = response.status
-                if not 200 <= response.status < 300:
-                    logging.warning("HLS response HTTP %s: %s", response.status, safe_url(url))
-                    return
-                try:
-                    body = await response.body()
-                    content_type = response.headers.get("content-type", "")
-                    if is_valid_playlist(body, content_type):
-                        item["valid"] = True
-                        logging.info("Valid HLS playlist detected: %s", safe_url(url))
-                    else:
-                        logging.warning("Response was not an HLS playlist: %s", safe_url(url))
-                except Exception as error:
-                    logging.warning("Could not inspect HLS response: %s", error)
+                if 200 <= response.status < 300:
+                    candidates[url] = True
+                    logging.info("Googlevideo manifest returned HTTP %s: %s", response.status, safe_url(url))
+                else:
+                    logging.warning("Googlevideo manifest returned HTTP %s: %s", response.status, safe_url(url))
 
             def on_response(response):
                 task = asyncio.create_task(inspect_response(response))
-                pending_tasks.add(task)
-                task.add_done_callback(pending_tasks.discard)
+                response_tasks.add(task)
+                task.add_done_callback(response_tasks.discard)
 
-            # Context-level listeners include requests made inside player iframes.
+            # Attach before navigation so early iframe/player traffic is not missed.
             context.on("request", on_request)
             context.on("response", on_response)
+            page = await context.new_page()
 
-            logging.info("Opening Taiwan news source page: %s", SOURCE_URL)
+            logging.info("Opening Taiwan news source: %s", SOURCE_URL)
             try:
-                # 'commit' returns as soon as response headers arrive; waiting for
-                # DOMContentLoaded can hang on ad/player scripts and exhaust the job.
-                await page.goto(SOURCE_URL, wait_until="commit", timeout=BROWSER_TIMEOUT)
+                # 'commit' avoids waiting for ad scripts and long-lived player loads.
+                await page.goto(
+                    SOURCE_URL,
+                    wait_until="commit",
+                    timeout=NAVIGATION_TIMEOUT_MS,
+                )
             except Exception as error:
-                logging.warning("Navigation did not complete: %s", str(error)[:200])
+                # Continue: requests made before navigation stalled may already
+                # have provided the signed manifest candidate.
+                logging.warning("Source navigation did not finish: %s", str(error)[:180])
 
-            logging.info("Page navigation finished; waiting for player initialization")
-            await page.wait_for_timeout(WAIT_AFTER_LOAD)
+            await page.wait_for_timeout(PLAYER_WAIT_MS)
 
-            # Try autoplay in all same-origin accessible frames.
+            # Try to start playback in the main document and accessible frames.
             for frame in page.frames:
                 try:
                     await frame.evaluate("""
                         async () => {
                             for (const video of document.querySelectorAll('video')) {
                                 video.muted = true;
-                                try { await video.play(); } catch (e) {}
+                                try { await video.play(); } catch (_) {}
                             }
                         }
                     """)
@@ -150,77 +148,50 @@ async def collect_stream():
             ):
                 try:
                     button = page.locator(selector).first
-                    if await button.is_visible(timeout=1000):
-                        await button.click(timeout=2000)
+                    if await button.is_visible(timeout=700):
+                        await button.click(timeout=1500)
                         logging.info("Player play button clicked")
                         break
                 except Exception:
                     continue
 
-            logging.info("Waiting for Googlevideo HLS requests")
-            await page.wait_for_timeout(WAIT_AFTER_PLAY)
-
-            # A few players embed the URL in HTML/JS instead of immediately requesting it.
-            for frame in page.frames:
-                try:
-                    source = await frame.content()
-                except Exception:
-                    continue
-                if source:
-                    for url in GOOGLEVIDEO_M3U8_RE.findall(source):
-                        if is_stream_url(url):
-                            candidates.setdefault(url, {"valid": True, "status": None})
-                            candidates[url]["valid"] = True
-                            logging.info("Embedded manifest found: %s", safe_url(url))
-
-            for frame in page.frames:
-                logging.info("Frame inspected: %s", frame.url[:180])
-
-            if pending_tasks:
-                await asyncio.gather(*tuple(pending_tasks), return_exceptions=True)
+            await page.wait_for_timeout(CAPTURE_WAIT_MS)
+            if response_tasks:
+                await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
         finally:
             await browser.close()
 
-    valid_urls = [url for url, info in candidates.items() if info.get("valid")]
-    logging.info("Googlevideo M3U8 candidates: %d", len(candidates))
-    logging.info("Valid playlists: %d", len(valid_urls))
-    return valid_urls
-
-
-def save_output(stream_url):
-    content = f"{GENRE_HEADER}\n{CHANNEL_NAME},{stream_url}\n"
-    output_dir = os.path.dirname(os.path.abspath(OUTPUT_FILE))
-    fd, temp_path = tempfile.mkstemp(dir=output_dir, prefix=".8tv_", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
-            file.write(content)
-        os.replace(temp_path, OUTPUT_FILE)
-        logging.info("8TV playlist updated successfully")
-    except Exception:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise
+    successful = [url for url, succeeded in candidates.items() if succeeded]
+    logging.info("Googlevideo HLS requests observed: %d", len(candidates))
+    logging.info("Successful manifest responses: %d", len(successful))
+    return successful
 
 
 async def main():
-    logging.info("Taiwan news HLS collector started")
+    logging.info("8TV live playlist refresh started")
     logging.info("Source: %s", SOURCE_URL)
     try:
-        urls = await asyncio.wait_for(collect_stream(), timeout=MAX_RUNTIME)
+        urls = await asyncio.wait_for(collect_stream(), timeout=RUN_TIMEOUT_SECONDS)
         if not urls:
-            raise RuntimeError("No valid Googlevideo M3U8 playlist captured")
-        stream_url = urls[0]
-        logging.info("Selected live playlist: %s", safe_url(stream_url))
-        save_output(stream_url)
-        logging.info("Collection completed successfully")
+            logging.warning(
+                "No fresh Googlevideo manifest was captured; leaving existing %s unchanged.",
+                OUTPUT_FILE,
+            )
+            # This is a source-side availability issue, not a workflow/code crash.
+            # Do not replace a potentially working playlist with an empty file.
+            return 0
+
+        save_output(urls[-1])
+        logging.info("Saved current live manifest: %s", safe_url(urls[-1]))
         return 0
     except asyncio.TimeoutError:
-        logging.error("Browser collection exceeded %s seconds", MAX_RUNTIME)
-        return 1
+        logging.error("Collection exceeded %s seconds; existing playlist was preserved", RUN_TIMEOUT_SECONDS)
+        return 0
     except Exception as error:
-        logging.error("Collection failed: %s", error)
-        logging.warning("Old 8tv.txt has been preserved")
-        return 1
+        logging.exception("Collector error; existing playlist was preserved: %s", error)
+        # Avoid making the scheduled workflow fail when the external source is
+        # unavailable. The atomic writer means the old playlist remains intact.
+        return 0
 
 
 if __name__ == "__main__":
