@@ -12,38 +12,30 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
 
-# ==================================================
-# CONFIGURATION
-# ==================================================
-
 SOURCE_URL = "https://tvivu.com/watch/globalnews-tv-taiwan-news"
 OUTPUT_FILE = "8tv.txt"
 CHANNEL_NAME = "8tv"
 GENRE_HEADER = "iptv,#genre#"
 WAIT_AFTER_LOAD = 12000
 WAIT_AFTER_PLAY = 10000
-BROWSER_TIMEOUT = 60000
-MAX_RUNTIME = 90
+BROWSER_TIMEOUT = 30000
+MAX_RUNTIME = 150
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/130.0.0.0 Safari/537.36"
 )
 
-# Catch complete manifest URLs embedded in page/frame HTML or JavaScript.
+# The signed manifest's URL path ends in .m3u8; its query contains expiring tokens.
 GOOGLEVIDEO_M3U8_RE = re.compile(
     r"https?://[^\s\"'<>]+manifest\.googlevideo\.com/[^\s\"'<>]*?\.m3u8(?:\?[^\s\"'<>]*)?",
     re.IGNORECASE,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 def is_stream_url(url):
-    """Accept signed Googlevideo HLS manifests, including expiring URLs."""
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
@@ -57,8 +49,8 @@ def is_stream_url(url):
 
 
 def safe_url(url):
-    """Keep signed URL query parameters out of Actions logs."""
     parsed = urlparse(url)
+    # Signed query parameters must not be written to workflow logs.
     return f"{parsed.hostname}{parsed.path}"
 
 
@@ -67,19 +59,6 @@ def is_valid_playlist(data, content_type):
         return False
     text = data.decode("utf-8", errors="replace").lstrip("\ufeff \r\n\t")
     return text.startswith("#EXTM3U") or "mpegurl" in content_type.lower()
-
-
-async def extract_embedded_manifests(page):
-    """Find manifest URLs that are present in document or frame source."""
-    found = set()
-    for frame in page.frames:
-        try:
-            source = await frame.content()
-        except Exception:
-            continue
-        if source:
-            found.update(GOOGLEVIDEO_M3U8_RE.findall(source))
-    return [url for url in found if is_stream_url(url)]
 
 
 async def collect_stream():
@@ -116,12 +95,8 @@ async def collect_stream():
                     return
                 item = candidates.setdefault(url, {"valid": False, "status": None})
                 item["status"] = response.status
-                if not (200 <= response.status < 300):
-                    logging.warning(
-                        "Googlevideo HLS returned HTTP %s: %s",
-                        response.status,
-                        safe_url(url),
-                    )
+                if not 200 <= response.status < 300:
+                    logging.warning("HLS response HTTP %s: %s", response.status, safe_url(url))
                     return
                 try:
                     body = await response.body()
@@ -129,6 +104,8 @@ async def collect_stream():
                     if is_valid_playlist(body, content_type):
                         item["valid"] = True
                         logging.info("Valid HLS playlist detected: %s", safe_url(url))
+                    else:
+                        logging.warning("Response was not an HLS playlist: %s", safe_url(url))
                 except Exception as error:
                     logging.warning("Could not inspect HLS response: %s", error)
 
@@ -137,23 +114,22 @@ async def collect_stream():
                 pending_tasks.add(task)
                 task.add_done_callback(pending_tasks.discard)
 
-            # Context-level listeners also see requests from player iframes.
+            # Context-level listeners include requests made inside player iframes.
             context.on("request", on_request)
             context.on("response", on_response)
 
             logging.info("Opening Taiwan news source page: %s", SOURCE_URL)
             try:
-                await page.goto(
-                    SOURCE_URL,
-                    wait_until="domcontentloaded",
-                    timeout=BROWSER_TIMEOUT,
-                )
+                # 'commit' returns as soon as response headers arrive; waiting for
+                # DOMContentLoaded can hang on ad/player scripts and exhaust the job.
+                await page.goto(SOURCE_URL, wait_until="commit", timeout=BROWSER_TIMEOUT)
             except Exception as error:
-                logging.warning("Page navigation warning: %s", str(error)[:200])
+                logging.warning("Navigation did not complete: %s", str(error)[:200])
 
+            logging.info("Page navigation finished; waiting for player initialization")
             await page.wait_for_timeout(WAIT_AFTER_LOAD)
 
-            # Attempt playback on the top page and its frames.
+            # Try autoplay in all same-origin accessible frames.
             for frame in page.frames:
                 try:
                     await frame.evaluate("""
@@ -181,15 +157,21 @@ async def collect_stream():
                 except Exception:
                     continue
 
-            logging.info("Waiting for Googlevideo HLS requests...")
+            logging.info("Waiting for Googlevideo HLS requests")
             await page.wait_for_timeout(WAIT_AFTER_PLAY)
 
-            # Some pages embed a manifest in player HTML rather than requesting it
-            # during the short observation window. Preserve the whole signed URL.
-            for url in await extract_embedded_manifests(page):
-                candidates.setdefault(url, {"valid": True, "status": None})
-                candidates[url]["valid"] = True
-                logging.info("Embedded manifest URL found: %s", safe_url(url))
+            # A few players embed the URL in HTML/JS instead of immediately requesting it.
+            for frame in page.frames:
+                try:
+                    source = await frame.content()
+                except Exception:
+                    continue
+                if source:
+                    for url in GOOGLEVIDEO_M3U8_RE.findall(source):
+                        if is_stream_url(url):
+                            candidates.setdefault(url, {"valid": True, "status": None})
+                            candidates[url]["valid"] = True
+                            logging.info("Embedded manifest found: %s", safe_url(url))
 
             for frame in page.frames:
                 logging.info("Frame inspected: %s", frame.url[:180])
@@ -233,7 +215,7 @@ async def main():
         logging.info("Collection completed successfully")
         return 0
     except asyncio.TimeoutError:
-        logging.error("Browser collection timed out")
+        logging.error("Browser collection exceeded %s seconds", MAX_RUNTIME)
         return 1
     except Exception as error:
         logging.error("Collection failed: %s", error)
