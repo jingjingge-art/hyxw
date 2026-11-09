@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import os
+import re
 import sys
 import tempfile
 from urllib.parse import urlparse
@@ -15,7 +16,6 @@ from playwright.async_api import async_playwright
 # CONFIGURATION
 # ==================================================
 
-# Keep the Taiwan news source page unchanged.
 SOURCE_URL = "https://tvivu.com/watch/globalnews-tv-taiwan-news"
 OUTPUT_FILE = "8tv.txt"
 CHANNEL_NAME = "8tv"
@@ -30,6 +30,12 @@ USER_AGENT = (
     "Chrome/130.0.0.0 Safari/537.36"
 )
 
+# Catch complete manifest URLs embedded in page/frame HTML or JavaScript.
+GOOGLEVIDEO_M3U8_RE = re.compile(
+    r"https?://[^\s\"'<>]+manifest\.googlevideo\.com/[^\s\"'<>]*?\.m3u8(?:\?[^\s\"'<>]*)?",
+    re.IGNORECASE,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -37,14 +43,13 @@ logging.basicConfig(
 
 
 def is_stream_url(url):
-    """Accept HLS manifests served by Google Video's signed live endpoints."""
+    """Accept signed Googlevideo HLS manifests, including expiring URLs."""
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
-        is_googlevideo = host == "googlevideo.com" or host.endswith(".googlevideo.com")
         return (
             parsed.scheme in ("http", "https")
-            and is_googlevideo
+            and (host == "googlevideo.com" or host.endswith(".googlevideo.com"))
             and parsed.path.lower().endswith(".m3u8")
         )
     except Exception:
@@ -52,7 +57,7 @@ def is_stream_url(url):
 
 
 def safe_url(url):
-    """Do not print signed/expiring query parameters into Actions logs."""
+    """Keep signed URL query parameters out of Actions logs."""
     parsed = urlparse(url)
     return f"{parsed.hostname}{parsed.path}"
 
@@ -62,6 +67,19 @@ def is_valid_playlist(data, content_type):
         return False
     text = data.decode("utf-8", errors="replace").lstrip("\ufeff \r\n\t")
     return text.startswith("#EXTM3U") or "mpegurl" in content_type.lower()
+
+
+async def extract_embedded_manifests(page):
+    """Find manifest URLs that are present in document or frame source."""
+    found = set()
+    for frame in page.frames:
+        try:
+            source = await frame.content()
+        except Exception:
+            continue
+        if source:
+            found.update(GOOGLEVIDEO_M3U8_RE.findall(source))
+    return [url for url in found if is_stream_url(url)]
 
 
 async def collect_stream():
@@ -89,49 +107,37 @@ async def collect_stream():
             def on_request(request):
                 url = request.url
                 if is_stream_url(url):
-                    candidates.setdefault(url, {"valid": False})
+                    candidates.setdefault(url, {"valid": False, "status": None})
                     logging.info("Googlevideo HLS request detected: %s", safe_url(url))
 
             async def inspect_response(response):
                 url = response.url
                 if not is_stream_url(url):
                     return
-
-                item = candidates.setdefault(url, {"valid": False})
+                item = candidates.setdefault(url, {"valid": False, "status": None})
                 item["status"] = response.status
                 if not (200 <= response.status < 300):
                     logging.warning(
-                        "Googlevideo HLS request returned HTTP %s: %s",
+                        "Googlevideo HLS returned HTTP %s: %s",
                         response.status,
                         safe_url(url),
                     )
                     return
-
                 try:
                     body = await response.body()
                     content_type = response.headers.get("content-type", "")
                     if is_valid_playlist(body, content_type):
                         item["valid"] = True
                         logging.info("Valid HLS playlist detected: %s", safe_url(url))
-                    else:
-                        logging.warning(
-                            "Googlevideo URL did not return an HLS playlist: %s",
-                            safe_url(url),
-                        )
                 except Exception as error:
-                    logging.warning(
-                        "Could not inspect Googlevideo response (%s): %s",
-                        safe_url(url),
-                        error,
-                    )
+                    logging.warning("Could not inspect HLS response: %s", error)
 
             def on_response(response):
                 task = asyncio.create_task(inspect_response(response))
                 pending_tasks.add(task)
                 task.add_done_callback(pending_tasks.discard)
 
-            # Listen on the browser context so requests from player iframes/popups
-            # are captured as well as requests from the top-level page.
+            # Context-level listeners also see requests from player iframes.
             context.on("request", on_request)
             context.on("response", on_response)
 
@@ -145,21 +151,21 @@ async def collect_stream():
             except Exception as error:
                 logging.warning("Page navigation warning: %s", str(error)[:200])
 
-            logging.info("Waiting for player initialization...")
             await page.wait_for_timeout(WAIT_AFTER_LOAD)
 
-            # Try autoplaying any video element, including ones on the main page.
-            try:
-                await page.evaluate("""
-                    async () => {
-                        for (const video of document.querySelectorAll('video')) {
-                            video.muted = true;
-                            try { await video.play(); } catch (e) {}
+            # Attempt playback on the top page and its frames.
+            for frame in page.frames:
+                try:
+                    await frame.evaluate("""
+                        async () => {
+                            for (const video of document.querySelectorAll('video')) {
+                                video.muted = true;
+                                try { await video.play(); } catch (e) {}
+                            }
                         }
-                    }
-                """)
-            except Exception:
-                pass
+                    """)
+                except Exception:
+                    pass
 
             for selector in (
                 ".vjs-big-play-button",
@@ -178,6 +184,13 @@ async def collect_stream():
             logging.info("Waiting for Googlevideo HLS requests...")
             await page.wait_for_timeout(WAIT_AFTER_PLAY)
 
+            # Some pages embed a manifest in player HTML rather than requesting it
+            # during the short observation window. Preserve the whole signed URL.
+            for url in await extract_embedded_manifests(page):
+                candidates.setdefault(url, {"valid": True, "status": None})
+                candidates[url]["valid"] = True
+                logging.info("Embedded manifest URL found: %s", safe_url(url))
+
             for frame in page.frames:
                 logging.info("Frame inspected: %s", frame.url[:180])
 
@@ -187,7 +200,7 @@ async def collect_stream():
             await browser.close()
 
     valid_urls = [url for url, info in candidates.items() if info.get("valid")]
-    logging.info("Googlevideo M3U8 requests: %d", len(candidates))
+    logging.info("Googlevideo M3U8 candidates: %d", len(candidates))
     logging.info("Valid playlists: %d", len(valid_urls))
     return valid_urls
 
@@ -214,9 +227,6 @@ async def main():
         urls = await asyncio.wait_for(collect_stream(), timeout=MAX_RUNTIME)
         if not urls:
             raise RuntimeError("No valid Googlevideo M3U8 playlist captured")
-
-        # Keep the complete signed URL (including its expiring query parameters)
-        # in the playlist, but never include those parameters in workflow logs.
         stream_url = urls[0]
         logging.info("Selected live playlist: %s", safe_url(stream_url))
         save_output(stream_url)
