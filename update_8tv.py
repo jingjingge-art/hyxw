@@ -17,7 +17,7 @@ from playwright.async_api import async_playwright
 # CONFIGURATION
 # ==================================================
 
-SOURCE_URL = "https://tvmalay.my/8tv/"
+SOURCE_URL = "https://tvivu.com/watch/globalnews-tv-taiwan-news"
 
 OUTPUT_FILE = "8tv.txt"
 
