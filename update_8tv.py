@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
-SOURCE_URL = "https://tvivu.com/watch/globalnews-tv-taiwan-news"
+SOURCE_URL = "https://tvmalay.my/8tv/"
 OUTPUT_FILE = "8tv.txt"
 CHANNEL_NAME = "8tv"
 GENRE_HEADER = "iptv,#genre#"
